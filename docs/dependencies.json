@@ -1,0 +1,34 @@
+[
+  {
+    "repository": "Uniswap/v4-core",
+    "tag": "v4.0.0",
+    "path": "lib/v4-core",
+    "archive": "https://codeload.github.com/Uniswap/v4-core/tar.gz/refs/tags/v4.0.0",
+    "sha256": "1208271acb0cda5c1945e42d6d827797c628b04f7aeded0cc74e278197acbd03",
+    "files": 96
+  },
+  {
+    "repository": "OpenZeppelin/openzeppelin-contracts",
+    "tag": "v5.0.2",
+    "path": "lib/openzeppelin-contracts",
+    "archive": "https://codeload.github.com/OpenZeppelin/openzeppelin-contracts/tar.gz/refs/tags/v5.0.2",
+    "sha256": "18c7b7e949b9a82dcd8cd394426c9c2636dfc263aa2317d4749dbfa0c7b3925a",
+    "files": 232
+  },
+  {
+    "repository": "foundry-rs/forge-std",
+    "tag": "v1.9.7",
+    "path": "lib/forge-std",
+    "archive": "https://codeload.github.com/foundry-rs/forge-std/tar.gz/refs/tags/v1.9.7",
+    "sha256": "45157353ab49eab01d294565866731e599b32401757229689ee459aa26b7ee94",
+    "files": 31
+  },
+  {
+    "repository": "transmissions11/solmate",
+    "commit": "4b47a19038b798b4a33d9749d25e570443520647",
+    "path": "lib/solmate",
+    "archive": "https://codeload.github.com/transmissions11/solmate/tar.gz/4b47a19038b798b4a33d9749d25e570443520647",
+    "sha256": "9aa78449f8bc10931520500ec24734f089af9ac875a3334d8b512f8727241667",
+    "files": 61
+  }
+]
