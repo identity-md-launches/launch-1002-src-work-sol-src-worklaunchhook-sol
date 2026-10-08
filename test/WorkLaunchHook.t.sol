@@ -21,6 +21,7 @@ import {WorkLaunchHook} from "../src/WorkLaunchHook.sol";
 import {HookMiner} from "../script/HookMiner.sol";
 import {PairToken, RejectNative, ForceNativeBalance} from "./helpers/PairToken.sol";
 
+/// forge-config: default.fuzz.runs = 1000
 contract WorkLaunchHookTest is Test {
     using StateLibrary for IPoolManager;
 
@@ -325,7 +326,7 @@ contract WorkLaunchHookTest is Test {
     }
 
     function testFuzzUnauthorizedAdmin(address caller, uint256 fee) public {
-        vm.assume(caller != TREASURY);
+        if (caller == TREASURY) caller = address(this);
         fee = bound(fee, 0, 1000);
         vm.prank(caller);
         vm.expectRevert();
@@ -369,6 +370,22 @@ contract WorkLaunchHookTest is Test {
         assertLe(hook.feeNow(), current);
         vm.warp(OPEN_TIME + 900);
         assertEq(hook.feeNow(), fee);
+    }
+
+    function testFuzzRampComplementaryTimesHaveLinearSum(uint256 elapsed, uint256 fee) public {
+        elapsed = bound(elapsed, 0, 900);
+        fee = bound(fee, 0, 1000);
+        vm.prank(TREASURY);
+        hook.setStandingFee(fee);
+        manager.initialize(key, INITIAL_PRICE);
+        vm.warp(OPEN_TIME + elapsed);
+        uint256 first = hook.feeNow();
+        vm.warp(OPEN_TIME + 900 - elapsed);
+        uint256 sum = first + hook.feeNow();
+        // On a line, samples at complementary times sum to its two endpoints.
+        // Flooring can reduce this by at most one basis point in total.
+        assertGe(sum, 5000 + fee - 1);
+        assertLe(sum, 5000 + fee);
     }
 
     function _assertSwapAgainstControl(bool zeroForOne, bool exactInput, uint256 amount) internal {
@@ -562,6 +579,64 @@ contract WorkLaunchHookTest is Test {
         pair.blockRecipient(address(0));
         hook.sweep();
         _assertEmptyHook();
+    }
+
+    function testDonationFailureAfterUnlockRollsBackClaimPayout() public {
+        _initializeAndFund();
+        // Only WORK claims exist. The callback can pay them successfully, then
+        // the later direct-IMD donation leg fails outside the manager unlock.
+        _swap(key, Currency.unwrap(key.currency1) == address(work), -100 ether);
+        uint256 claims = manager.balanceOf(address(hook), uint160(address(work)));
+        assertGt(claims, 0);
+        assertEq(manager.balanceOf(address(hook), uint160(IMD)), 0);
+        pair.transfer(address(hook), 1);
+        uint256 managerBalance = work.balanceOf(address(manager));
+        pair.blockRecipient(TREASURY);
+        vm.expectRevert();
+        hook.sweep();
+        assertEq(manager.balanceOf(address(hook), uint160(address(work))), claims);
+        assertEq(work.balanceOf(address(manager)), managerBalance);
+        assertEq(work.balanceOf(TREASURY), 0);
+        assertEq(pair.balanceOf(TREASURY), 0);
+        assertEq(pair.balanceOf(address(hook)), 1);
+        pair.blockRecipient(address(0));
+        hook.sweep();
+        assertEq(work.balanceOf(TREASURY), claims);
+        assertEq(pair.balanceOf(TREASURY), 1);
+        _assertEmptyHook();
+    }
+
+    function testSettlementRevertPreservesExistingFeesDonationsAndPoolState() public {
+        _accrueBothCurrencies();
+        work.transfer(address(hook), 1 ether);
+        pair.transfer(address(hook), 2 ether);
+        uint256 claims0 = manager.balanceOf(address(hook), key.currency0.toId());
+        uint256 claims1 = manager.balanceOf(address(hook), key.currency1.toId());
+        (uint160 priceBefore, int24 tickBefore,,) = manager.getSlot0(key.toId());
+        uint256 managerWork = work.balanceOf(address(manager));
+        uint256 managerPair = pair.balanceOf(address(manager));
+        IERC20(Currency.unwrap(key.currency0)).approve(address(router), 0);
+        vm.expectRevert();
+        _swap(key, true, 100 ether);
+        (uint160 priceAfter, int24 tickAfter,,) = manager.getSlot0(key.toId());
+        assertEq(priceAfter, priceBefore);
+        assertEq(tickAfter, tickBefore);
+        assertEq(manager.balanceOf(address(hook), key.currency0.toId()), claims0);
+        assertEq(manager.balanceOf(address(hook), key.currency1.toId()), claims1);
+        assertEq(work.balanceOf(address(manager)), managerWork);
+        assertEq(pair.balanceOf(address(manager)), managerPair);
+        assertEq(work.balanceOf(address(hook)), 1 ether);
+        assertEq(pair.balanceOf(address(hook)), 2 ether);
+        hook.sweep();
+        _assertEmptyHook();
+    }
+
+    function testNoLiquiditySwapCannotInventFeeClaims() public {
+        manager.initialize(key, INITIAL_PRICE);
+        _swap(key, true, -100 ether);
+        _assertEmptyHook();
+        assertEq(work.balanceOf(address(manager)), 0);
+        assertEq(pair.balanceOf(address(manager)), 0);
     }
 
     function testForcedWeiCannotBlockTokenClaimsOrDonations() public {
