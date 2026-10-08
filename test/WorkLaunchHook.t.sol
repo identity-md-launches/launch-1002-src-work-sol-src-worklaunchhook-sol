@@ -19,7 +19,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Work} from "../src/Work.sol";
 import {WorkLaunchHook} from "../src/WorkLaunchHook.sol";
 import {HookMiner} from "../script/HookMiner.sol";
-import {PairToken, RejectNative} from "./helpers/PairToken.sol";
+import {PairToken, RejectNative, ForceNativeBalance} from "./helpers/PairToken.sol";
 
 contract WorkLaunchHookTest is Test {
     using StateLibrary for IPoolManager;
@@ -143,6 +143,65 @@ contract WorkLaunchHookTest is Test {
         assertEq(price, INITIAL_PRICE);
         assertEq(tick, 0);
         assertEq(fee, 12500);
+    }
+
+    function testReviewThirdPartyCanInitializeBeforeFactory() public {
+        uint160 attackerPrice = TickMath.MIN_SQRT_PRICE + 1;
+        vm.prank(makeAddr("first initializer"));
+        manager.initialize(key, attackerPrice);
+        (uint160 price,,,) = manager.getSlot0(key.toId());
+        assertEq(price, attackerPrice);
+        assertEq(hook.openedAt(), OPEN_TIME);
+        vm.expectRevert();
+        manager.initialize(key, INITIAL_PRICE);
+        vm.warp(OPEN_TIME + 1000);
+        assertEq(manager.getLiquidity(key.toId()), 0);
+        assertEq(hook.feeNow(), 200);
+    }
+
+    function testReviewRampCanExpireBeforeFirstLiquidity() public {
+        manager.initialize(key, INITIAL_PRICE);
+        manager.initialize(controlKey, INITIAL_PRICE);
+        vm.warp(OPEN_TIME + 900);
+        assertEq(manager.getLiquidity(key.toId()), 0);
+        IPoolManager.ModifyLiquidityParams memory p =
+            IPoolManager.ModifyLiquidityParams(-600, 600, 1_000_000 ether, bytes32(0));
+        liquidityRouter.modifyLiquidity(key, p, "");
+        liquidityRouter.modifyLiquidity(controlKey, p, "");
+        assertEq(hook.feeNow(), 200);
+        _assertSwapAgainstControl(Currency.unwrap(key.currency0) == IMD, true, 100 ether);
+    }
+
+    function testReviewHooklessPoolPaysNoHookFee() public {
+        manager.initialize(key, INITIAL_PRICE);
+        controlKey.fee = 3000;
+        manager.initialize(controlKey, INITIAL_PRICE);
+        liquidityRouter.modifyLiquidity(
+            controlKey, IPoolManager.ModifyLiquidityParams(-600, 600, 1_000_000 ether, bytes32(0)), ""
+        );
+        bool buyIsZeroForOne = Currency.unwrap(controlKey.currency0) == IMD;
+        BalanceDelta result = _swap(controlKey, buyIsZeroForOne, -100 ether);
+        assertGt(buyIsZeroForOne ? result.amount1() : result.amount0(), 99 ether);
+        assertEq(hook.feeNow(), 5000);
+        _assertEmptyHook();
+    }
+
+    function testReviewExactInputDustRoundsToZero() public {
+        _initializeAndFund();
+        vm.warp(OPEN_TIME + 900);
+        bool buyIsZeroForOne = Currency.unwrap(key.currency0) == IMD;
+        BalanceDelta result = _swap(key, buyIsZeroForOne, -50);
+        assertEq(buyIsZeroForOne ? result.amount1() : result.amount0(), 48);
+        _assertEmptyHook();
+    }
+
+    function testReviewPermissionsAreAddressBitsWithoutGetter() public view {
+        (bool success,) = address(hook).staticcall(abi.encodeWithSignature("getHookPermissions()"));
+        assertFalse(success);
+        assertEq(
+            uint160(address(hook)) & Hooks.ALL_HOOK_MASK,
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+        );
     }
 
     function testInitializeWorksWithBothTokenOrderings() public {
@@ -330,7 +389,8 @@ contract WorkLaunchHookTest is Test {
         bool chargeToken0 = exactInput ? !zeroForOne : zeroForOne;
         int256 baseCharge = chargeToken0 ? int256(base.amount0()) : int256(base.amount1());
         uint256 magnitude = uint256(baseCharge < 0 ? -baseCharge : baseCharge);
-        uint256 expected = magnitude * hook.feeNow() / 10_000;
+        uint256 rate = hook.feeNow();
+        uint256 expected = magnitude * rate / (exactInput ? 10_000 : 10_000 - rate);
         assertEq(int256(actual.amount0()), int256(base.amount0()) - (chargeToken0 ? int256(expected) : int256(0)));
         assertEq(int256(actual.amount1()), int256(base.amount1()) - (chargeToken0 ? int256(0) : int256(expected)));
         assertEq(manager.balanceOf(address(hook), key.currency0.toId()) - claimsBefore0, chargeToken0 ? expected : 0);
@@ -342,6 +402,14 @@ contract WorkLaunchHookTest is Test {
         assertEq(token0.balanceOf(address(hook)), 0);
         assertEq(token1.balanceOf(address(hook)), 0);
         assertEq(work.totalSupply(), 1_000_000_000 ether);
+
+        // Independently measure the effective rate from the trader's actual deltas.
+        // Input fees are a fraction of total paid; output fees are a fraction of pool output.
+        int256 actualCharge = chargeToken0 ? int256(actual.amount0()) : int256(actual.amount1());
+        uint256 charged = uint256(baseCharge - actualCharge);
+        uint256 gross = exactInput ? magnitude : uint256(-actualCharge);
+        assertLe(charged * 10_000, gross * rate);
+        assertLt(gross * rate - charged * 10_000, 10_000, "effective fee shortfall exceeds rounding");
     }
 
     function _assertAllSwapModes() internal {
@@ -368,6 +436,14 @@ contract WorkLaunchHookTest is Test {
         _initializeAndFund();
         vm.warp(OPEN_TIME + 900);
         assertEq(hook.feeNow(), 200);
+        _assertAllSwapModes();
+    }
+
+    function testAllSwapModesAtMaxStandingFee() public {
+        _initializeAndFund();
+        vm.warp(OPEN_TIME + 900);
+        vm.prank(TREASURY);
+        hook.setStandingFee(1000);
         _assertAllSwapModes();
     }
 
@@ -437,8 +513,6 @@ contract WorkLaunchHookTest is Test {
         uint256 managerIMD = pair.balanceOf(address(manager));
         work.transfer(address(hook), 7 ether);
         pair.transfer(address(hook), 9 ether);
-        vm.deal(address(hook), 3 ether); // Forced native balance; hook has no receive().
-        uint256 nativeBefore = TREASURY.balance;
         address caller = makeAddr("sweeper");
         vm.prank(caller);
         hook.sweep();
@@ -446,7 +520,6 @@ contract WorkLaunchHookTest is Test {
         assertEq(pair.balanceOf(TREASURY), claimIMD + 9 ether);
         assertEq(work.balanceOf(address(manager)), managerWork - claimWork);
         assertEq(pair.balanceOf(address(manager)), managerIMD - claimIMD);
-        assertEq(TREASURY.balance, nativeBefore + 3 ether);
         assertEq(work.balanceOf(caller), 0);
         assertEq(pair.balanceOf(caller), 0);
         _assertEmptyHook();
@@ -491,20 +564,33 @@ contract WorkLaunchHookTest is Test {
         _assertEmptyHook();
     }
 
-    function testRevertingNativeTransferRollsBackClaimRedemption() public {
+    function testForcedWeiCannotBlockTokenClaimsOrDonations() public {
         _accrueBothCurrencies();
         uint256 claimIMD = manager.balanceOf(address(hook), uint160(IMD));
         uint256 claimWork = manager.balanceOf(address(hook), uint160(address(work)));
         RejectNative rejector = new RejectNative();
         vm.etch(TREASURY, address(rejector).code);
-        vm.deal(address(hook), 1 ether);
-        vm.expectRevert();
+        work.transfer(address(hook), 7 ether);
+        pair.transfer(address(hook), 9 ether);
+        address griefer = makeAddr("forced ETH sender");
+        vm.deal(griefer, 1);
+        vm.prank(griefer);
+        new ForceNativeBalance{value: 1}(payable(address(hook)));
+        assertEq(address(hook).balance, 1);
+        uint256 treasuryNativeBefore = TREASURY.balance;
+        vm.prank(makeAddr("permissionless sweeper"));
         hook.sweep();
-        assertEq(manager.balanceOf(address(hook), uint160(IMD)), claimIMD);
-        assertEq(manager.balanceOf(address(hook), uint160(address(work))), claimWork);
-        assertEq(pair.balanceOf(TREASURY), 0);
-        assertEq(work.balanceOf(TREASURY), 0);
-        assertEq(address(hook).balance, 1 ether);
+        assertEq(manager.balanceOf(address(hook), uint160(IMD)), 0);
+        assertEq(manager.balanceOf(address(hook), uint160(address(work))), 0);
+        assertEq(pair.balanceOf(TREASURY), claimIMD + 9 ether);
+        assertEq(work.balanceOf(TREASURY), claimWork + 7 ether);
+        assertEq(pair.balanceOf(address(hook)), 0);
+        assertEq(work.balanceOf(address(hook)), 0);
+        assertEq(address(hook).balance, 1);
+        assertEq(TREASURY.balance, treasuryNativeBefore);
+        hook.sweep();
+        assertEq(pair.balanceOf(TREASURY), claimIMD + 9 ether);
+        assertEq(work.balanceOf(TREASURY), claimWork + 7 ether);
     }
 
     function testSweepCannotNestInsideManagerUnlock() public {

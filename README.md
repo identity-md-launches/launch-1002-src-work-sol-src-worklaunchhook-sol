@@ -1,6 +1,6 @@
 # Work (WORK)
 
-This project implements the two supplied contracts without logic changes. `launch.json`, including its notes string, is preserved exactly. Formatting is the only change to the supplied Solidity.
+This project implements the supplied contracts with two reviewed corrections: input-side hook fees are calculated as a fraction of the total input paid, and sweeping excludes native currency so forced ETH cannot block token fee payouts. `launch.json`, including its notes string, is preserved exactly. [REVIEW.md](REVIEW.md) and [.imd-responses.json](.imd-responses.json) record the revision evidence and dispositions.
 
 ## Token and pool
 
@@ -29,7 +29,14 @@ standingFee + floor((5000 - standingFee) * (900 - e) / 900)
 
 At and after 900 seconds it equals `standingFee`. Before initialization, `feeNow()` also reports 5000. With the initial standing fee, rates at elapsed 0, 450, 899, and 900 seconds are 5000, 2600, 205, and 200 basis points.
 
-Every swap charges `floor(abs(unspecifiedDelta) * feeNow() / 10000)` on the unspecified side of the real PoolManager swap:
+Every swap **in this hooked pool** charges a fee on the unspecified side of the real PoolManager swap. Let `a` be that side's pre-hook delta and `r = feeNow()`:
+
+```
+a >= 0 (output): fee = floor(a * r / 10000)
+a < 0  (input):  fee = floor(abs(a) * r / (10000 - r))
+```
+
+The output fee is the fraction `r / 10000` of the pool output. The input fee is the same fraction of the trader's total input (`pool input + fee`), subject to rounding. At 50%, a 100-unit pool output leaves 50 units for the trader; a 100-unit pool input costs the trader 200 units, with 100 going to the treasury. At 2%, input is multiplied by `10000 / 9800`. LP fees and price impact still affect the underlying pool amounts, so this does not promise identical quotes across swap modes.
 
 | Swap | Currency charged | Effect on trader |
 | --- | --- | --- |
@@ -38,15 +45,17 @@ Every swap charges `floor(abs(unspecifiedDelta) * feeNow() / 10000)` on the unsp
 | Exact output, currency0 to currency1 | currency0 input | More currency0 paid |
 | Exact output, currency1 to currency0 | currency1 input | More currency1 paid |
 
-Fees use the executed amounts, including partial fills. Dust fees can round to zero. The LP fee is separate; hook fees are not converted to ETH. They remain in the charged currency, either WORK or IMD.
+Fees use the executed amounts, including partial fills, and round down by less than one smallest unit of the charged currency. Dust fees can round to zero: at 2%, an output below 50 units or a pool input below 49 units incurs no hook fee. The LP fee is separate; hook fees are not converted to ETH. They remain in the charged currency, either WORK or IMD.
+
+WORK transfers and trades in other pools have no hook fee. Anyone holding WORK can supply a hookless WORK/IMD pool, including during the launch ramp. The manifest's phrase "Every swap" describes swaps in the accepted hooked pool; it is not a token-wide tax or protection against trading elsewhere.
 
 Only `0xc9EAFE33A510a3a3d95A94c4f85AdaF6a3EA12a0` (the constant `B`) can call `setStandingFee(uint256)`. Values from 0 through 1000 basis points (0–10%) are accepted and emit `StandingFee(uint256)`. Changes are immediate, including during the launch ramp: they change its endpoint without resetting `openedAt`. There is no timelock, recipient change, administrator transfer, pause, or upgrade.
 
 ## Accrual and sweep
 
-`afterSwap` mints ERC-6909 claims to the hook in the PoolManager. Anyone may call `sweep()` while the manager is locked (outside an existing unlock). The manager calls `unlockCallback`, which burns both currencies' claims and transfers their underlying tokens directly to `B`. The sweep also transfers any direct IMD or WORK donations and any forced native balance from the hook to `B`. The caller receives no reward.
+`afterSwap` mints ERC-6909 claims to the hook in the PoolManager. Anyone may call `sweep()` while the manager is locked (outside an existing unlock). The manager calls `unlockCallback`, which burns both currencies' claims and transfers their underlying tokens directly to `B`. The sweep also transfers any direct IMD or WORK donations to `B`. Native currency is excluded: forced ETH remains at the hook without a recovery path and cannot prevent token fee payouts, even if the treasury rejects ETH. The caller receives no reward.
 
-Empty and repeated sweeps are valid. A failed token or native transfer reverts the entire transaction, restoring all claims and earlier transfers. `sweep()` cannot be nested within a PoolManager unlock. Only the configured manager can invoke the three callbacks.
+Empty and repeated sweeps are valid. A failed IMD or WORK transfer still reverts the entire transaction, restoring all claims and earlier transfers; token payouts remain coupled. `sweep()` cannot be nested within a PoolManager unlock. Only the configured manager can invoke the three callbacks.
 
 ## Offline build and tests
 
@@ -71,11 +80,11 @@ The network deployer consumes `launch.json`: it resolves `$poolManager` to the t
 
 The deployer must:
 
-1. Verify the selected PoolManager and the brief's fixed IMD address have the expected code and token behavior on the launch chain; confirm IMD metadata/decimals and the intended initial price. The hook does not check manager or token bytecode in its constructor. Live chain addresses were not verified in this offline test suite.
+1. Verify the selected PoolManager and the brief's fixed IMD address have the expected code and token behavior on the launch chain; confirm IMD metadata/decimals and the intended initial price. The hook does not check manager or token bytecode in its constructor. Revision-time `cast code` calls to the Sepolia publicnode endpoint returned `0x` for both IMD and the treasury. This is not deployment approval: do not launch until IMD exists at the fixed address and its behavior is verified. A treasury EOA needs no code, but its control and token receipt must be confirmed by the operator. Offline tests install only a test IMD runtime and cannot establish live readiness.
 2. Deploy WORK through the launch factory and ensure its full supply initially belongs to that factory.
 3. Form the hook init code as `type(WorkLaunchHook).creationCode ++ abi.encode(manager, token)`. Mine a salt for the **actual address executing CREATE2**, using the final compiler settings and final constructor arguments. `script/HookMiner.sol` implements the standard `keccak256(0xff ++ deployer ++ salt ++ keccak256(initCode))` prediction and a bounded salt search.
-4. Deploy at a vacant address with exactly flags `0x2044`, verify immutables, and initialize the sorted pool at the manifest price. Perform deployment and initialization atomically: initialization is permissionless and the supplied hook does not restrict the caller or check the initial price. Once deployed, another caller could otherwise initialize the accepted pool first at a different price and start the timer.
-5. Supply initial liquidity under the launch policy. Initialization alone creates no liquidity. Ensure the network's external review and source verification are complete before release.
+4. Deploy at a vacant address with exactly flags `0x2044`, verify immutables, initialize the sorted pool at the manifest price, and seed its initial liquidity **in one atomic factory transaction**. Initialization is permissionless and the supplied hook does not restrict the caller or check the initial price. A deployment split across transactions lets another caller initialize first at a different price and start the timer; there is no reset. The factory must revert the entire launch if initialization or liquidity seeding fails.
+5. Arrange liquidity amounts, ticks, custody, and approvals under the launch policy before that transaction. Initialization alone creates no liquidity: the 900-second ramp starts at initialization, not at first liquidity or first trade. If liquidity is delayed, the ramp can fully expire before trading starts. The hook does not enforce the factory's atomic seeding requirement, and idle time still consumes the ramp. Ensure the network's external review and source verification are complete before release.
 
 Changing the manager, token, CREATE2 deployer, compiler version/settings, or dependency code changes the predicted address and requires mining again. Do not substitute a vanity address or bypass the constructor checks.
 
@@ -91,6 +100,6 @@ The operator's tooling must supply the connection and signing configuration; thi
 
 ## After launch and assumptions
 
-The treasury may leave the 2% standing fee unchanged, or call `setStandingFee` with an integer from 0 to 1000. Any keeper or user may pay gas to call `sweep()` periodically; there is no automatic scheduler or caller incentive. The treasury must accept the paired tokens and any native balance being swept. A reverting recipient/token can prevent sweeps, as covered by rollback tests. Unrelated ERC-20 tokens sent to the hook have no rescue path.
+The treasury may leave the 2% standing fee unchanged, or call `setStandingFee` with an integer from 0 to 1000. Any keeper or user may pay gas to call `sweep()` periodically; there is no automatic scheduler or caller incentive. The treasury must accept both paired tokens; it need not accept ETH. A reverting paired token can prevent both token payouts, as covered by rollback tests. Unrelated ERC-20 tokens and forced ETH sent to the hook have no rescue path.
 
 The supplied design assumes the authentic v4 PoolManager, a normally transferring paired ERC-20, nonzero and nondecreasing chain timestamps, and a working fixed treasury. It does not support fee-on-transfer/rebasing token accounting. The fee ramp is a launch charge, not a guarantee against MEV; routers must enforce user slippage/deadline limits. There is no on-chain oracle, upgrade path, or emergency administrator. Independent security review remains the network's release responsibility; [REVIEW.md](REVIEW.md) records the checks performed here and their limits.

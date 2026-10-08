@@ -64,15 +64,17 @@ contract WorkLaunchHook {
     {
         bool u1 = (p.amountSpecified < 0) == p.zeroForOne;
         int128 a = u1 ? d.amount1() : d.amount0();
-        uint256 f = uint256(int256(a < 0 ? -a : a)) * feeNow() / 10000;
+        uint256 r = feeNow();
+        // An input-side fee must be the fraction r / 10000 of the total input paid.
+        uint256 f = uint256(int256(a < 0 ? -a : a)) * r / (a < 0 ? 10000 - r : 10000);
         if (f > 0) poolManager.mint(address(this), (u1 ? k.currency1 : k.currency0).toId(), f);
         return (IHooks.afterSwap.selector, int128(int256(f)));
     }
 
     function sweep() external {
         poolManager.unlock("");
-        address[3] memory c = [IMD, token, address(0)];
-        for (uint256 i; i < 3; ++i) {
+        address[2] memory c = [IMD, token];
+        for (uint256 i; i < 2; ++i) {
             Currency x = Currency.wrap(c[i]);
             uint256 v = x.balanceOfSelf();
             if (v > 0) x.transfer(B, v);

@@ -28,3 +28,10 @@ contract RejectNative {
         revert("Native rejected");
     }
 }
+
+/// @dev Created and destroyed in one transaction, forcing value even under Cancun.
+contract ForceNativeBalance {
+    constructor(address payable recipient) payable {
+        selfdestruct(recipient);
+    }
+}
