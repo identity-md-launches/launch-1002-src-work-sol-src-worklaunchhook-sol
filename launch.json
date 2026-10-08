@@ -2,15 +2,8 @@
   "kind": "univ4_hook",
   "hook": {
     "contract": "WorkLaunchHook",
-    "constructorArgs": [
-      "$poolManager",
-      "$token"
-    ],
-    "permissions": [
-      "beforeInitialize",
-      "afterSwap",
-      "afterSwapReturnDelta"
-    ]
+    "constructorArgs": ["$poolManager", "$token"],
+    "permissions": ["beforeInitialize", "afterSwap", "afterSwapReturnDelta"]
   },
   "token": {
     "contract": "Work",
